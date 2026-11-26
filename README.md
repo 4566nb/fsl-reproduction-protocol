@@ -140,9 +140,130 @@ ls "$WORK/qc/"*_{first,second}.csv
 
 With separately authorised historical derivatives, `bash run.sh replay NEW_WORK V1_ARCHIVE` links the archive inputs into a new workspace and regenerates numerical and visual QC. For the historical second-volunteer coverage follow-up, `bash run.sh coverage-replay NEW_WORK V2_ARCHIVE V1_PARCELS_CSV` compares the archived raw BOLD coverage against the first paired run. The scripts enumerate the expected input names. Run-local data, logs, and derived images belong in the authorised data workspace.
 
-## 8. Extend coverage screening to a second pair
+## 8. Complete the second pair and compare four scans
 
 Use the full raw mean and BET for raw signal coverage. Use the raw mean after dropping the first three volumes for BBR. The historical rescue for a supine T1 used a reviewed BET centre and cropping before FAST. Those coordinates are specific to that image. For a new scan, determine the brain centre and crop from the actual T1, then map the WM mask back to the full structural grid. Apply the same 70% and 50-voxel gates to each scan. Check raw **geometric field of view** and **usable signal coverage** separately before intersecting nodes across all four scans.
+
+### Completed analysis of the original two-posture scans
+
+The second-volunteer analysis used the original **250-volume** supine and upright scans. The four-scan comparison analysed 247 volumes per run after removing the first three. The field-map correction described in Section 9 remains pending.
+
+**Registration and ICA.** For Volunteer 2, run MCFLIRT on the full 250 volumes, then trim and compute the mean. Reuse the inspected BBR transforms from the coverage stage above and check the motion-corrected average on the corresponding T1. The trimmed mean gives BET and ICA a reference from the frames being analysed. Use a 100 s high-pass filter, explicit EPI mask, native grid and automatic MELODIC dimensionality without spatial smoothing.
+
+```bash
+# Use a writable analysis copy and keep the original archive read-only.
+STUDY_ROOT="/path/to/authorised/study"
+for posture in supine upright; do
+  (
+    cd "$STUDY_ROOT/volunteer2/$posture"
+    mkdir -p analysis_qc
+    mcflirt -in BOLD_original -out analysis_qc/BOLD_mc -plots -rmsrel -rmsabs
+    fslroi analysis_qc/BOLD_mc analysis_qc/BOLD_trim3 3 247
+    fslmaths analysis_qc/BOLD_trim3 -Tmean analysis_qc/BOLD_mean_mc
+    bet analysis_qc/BOLD_mean_mc analysis_qc/BOLD_brain -f 0.30 -m
+    fslmaths analysis_qc/BOLD_trim3 -bptf 13.157895 -1 \
+      -add analysis_qc/BOLD_mean_mc analysis_qc/BOLD_hp100 -odt float
+    melodic -i analysis_qc/BOLD_hp100.nii.gz -o analysis_qc/single.ica \
+      --tr=3.8 --nobet -m analysis_qc/BOLD_brain_mask.nii.gz --Omean
+  )
+done
+```
+
+**Why the same upstream steps need two WM files.** The supine WM probability image comes from the cropped T1 FAST output and is brought back to the full T1 grid before mapping to native EPI. The upright run uses the binarised WM segmentation in native BOLD. Historical atlas maps used the existing MNI → BOLD affines and nearest-neighbour interpolation. The saved BOLD reference and analysis images share the native grid. The four-scan replay uses these archived maps directly.
+
+```bash
+ATLAS="$FSLDIR/data/atlases/HarvardOxford/HarvardOxford-cort-maxprob-thr25-2mm.nii.gz"
+(
+  cd "$STUDY_ROOT/volunteer2/supine"
+  flirt -in "$ATLAS" -ref coverage_qc/BOLD_mean -applyxfm \
+    -init coverage_qc/MNI_to_BOLD_centered.mat -interp nearestneighbour -out analysis_qc/atlas_native
+  convert_xfm -omat analysis_qc/T1_to_BOLD.mat -inverse coverage_qc/BOLD_to_T1_centered.mat
+  flirt -in coverage_qc/T1_centered_crop_fast_pve_2 -ref coverage_qc/T1_1mm \
+    -applyxfm -usesqform -interp trilinear -out analysis_qc/T1_wm_pve
+  flirt -in analysis_qc/T1_wm_pve -ref coverage_qc/BOLD_mean -applyxfm \
+    -init analysis_qc/T1_to_BOLD.mat -interp trilinear -out analysis_qc/WM_pve_native
+)
+(
+  cd "$STUDY_ROOT/volunteer2/upright"
+  flirt -in "$ATLAS" -ref coverage_qc/BOLD_mean -applyxfm \
+    -init coverage_qc/MNI_to_BOLD.mat -interp nearestneighbour -out analysis_qc/atlas_native
+  convert_xfm -omat analysis_qc/T1_to_BOLD.mat -inverse coverage_qc/BOLD_to_T1.mat
+  flirt -in coverage_qc/BOLD_to_T1_fast_wmseg -ref coverage_qc/BOLD_mean \
+    -applyxfm -init analysis_qc/T1_to_BOLD.mat -interp nearestneighbour -out analysis_qc/WM_binary_native
+)
+```
+
+| Volunteer 2 run | MELODIC components | Regressed ICs and 1-based native slices | Target-slice SD reduction |
+| --- | ---: | --- | ---: |
+| Supine | 52 | 6 → 17, 9 → 9, 5 → 15 | 40–47% |
+| Upright | 74 | 16 → 8, 18 → 9, 31 → 6 | 34–35% |
+
+The ICs were chosen for a dominant single-slice pattern and agreement of the time course with the corresponding BOLD slice. Use the current decomposition's spatial maps and time series to confirm the IDs. Regression retained 247 volumes in both runs. Compare the SD of median slice percentage signal before and after regression to check whether the reduction concentrates in the target slices.
+
+```bash
+read -r -p 'Reviewed supine IC IDs: ' V2_SUPINE_ICS
+read -r -p 'Reviewed upright IC IDs: ' V2_UPRIGHT_ICS
+for posture in supine upright; do
+  (
+    cd "$STUDY_ROOT/volunteer2/$posture/analysis_qc"
+    if [ "$posture" = supine ]; then ids="$V2_SUPINE_ICS"; else ids="$V2_UPRIGHT_ICS"; fi
+    fsl_regfilt -i BOLD_hp100 -d single.ica/melodic_mix -m single.ica/mask \
+      -f "$ids" -o BOLD_ica_clean
+    fslval BOLD_ica_clean dim4
+  )
+done
+```
+
+### Use identical nodes, then compare six processing settings
+
+We repeated the coverage screen for all four runs at the motion-corrected stage using their ICA masks. **41, 30, 35 and 34** parcels passed in Volunteer 1 supine, Volunteer 1 upright, Volunteer 2 supine and Volunteer 2 upright respectively. The four-run intersection stayed at **29** Harvard–Oxford cortical labels (threshold 25, 2 mm, hemispheres combined). The earlier raw coverage check found 35 eligible Volunteer 2 upright parcels. The two screens use different masks and mean images.
+
+Power FD uses a 50 mm rotation radius. DVARS is the RMS voxelwise difference between adjacent volumes, divided by the pooled median BOLD intensity of the eroded usable mask and expressed as a percentage. Flag DVARS above each run's `Q3 + 1.5 × IQR`, estimated from 246 transitions. After trimming, the first analysed volume has a zero placeholder for both metrics and is eligible for censoring decisions. The FD means below exclude that placeholder. These means use the trimmed transitions, so the Volunteer 1 values can differ slightly from Section 2.
+
+| Run | Mean Power FD (mm) | FD ≤ 0.30 mm | FD and DVARS retained |
+| --- | ---: | ---: | ---: |
+| Volunteer 1 supine | 0.076 | 247 | 231 / 247 |
+| Volunteer 1 upright | 0.289 | 164 | 162 / 247 |
+| Volunteer 2 supine | 0.194 | 222 | 216 / 247 |
+| Volunteer 2 upright | 0.995 | 77 | 77 / 247 |
+
+Fit nuisance regression at the node level using an intercept, six motion parameters, their six first differences and one deep-WM mean. Use 247 time points when testing an uncensored arm and fit separately on the retained frames for each censored arm. The follow-up averages all qualifying WM voxels equally, using WM ≥ 0.95, at least 3 mm inside the 0.80 mask, and excluding all voxels with a native cortical atlas label. The upright Volunteer 2 mask is binary. These choices distinguish the four-scan follow-up from the single-regressor, slice-weighted WM sensitivity check in Section 6.
+
+| Setting | Input and frame selection |
+| --- | --- |
+| `hp_all` | High-pass BOLD, all 247 frames |
+| `ica_all` | ICA-cleaned BOLD, all 247 frames |
+| `motion_wm_all` | ICA-cleaned and motion/WM residualised, all 247 frames |
+| `motion_wm_fd03` | Same regression fitted on FD ≤ 0.30 mm |
+| `motion_wm_fd03_dvars` | Same regression fitted on frames that also pass DVARS |
+| `motion_wm_matched` | Same regression fitted on 77 selected eligible frames per scan |
+
+To match counts, take evenly spaced **positions in each scan's retained index list**, preserving their original order and identities. The 77 volumes are non-consecutive and the models have rank 14. Compare the same 29 × 29 matrices, then subtract supine from upright for each volunteer. Matched settings agreed in direction for **185 of 406 edges**. **32 of 406** had the same direction for both volunteers across all six settings, a post hoc descriptive count. These results describe two paired participants under substantial motion imbalance.
+
+### Check the unusually large upright motion peaks
+
+Repeat MCFLIRT on the original upright series with original volume 60 as the reference (`-refvol 59`, zero-based), then calculate FD after the same trim. In the reference sensitivity check, mean FD changed from **0.995 to 0.972 mm**, and the count meeting the **FD-only** threshold changed from **77 to 82**. The prominent peaks persisted. For original volume 250 and its predecessor, in-mask spatial correlation increased from approximately **0.52** raw to **0.94** after the original correction. Keep the default-reference results in the six-condition comparison so the reference test remains a separate diagnostic.
+
+```bash
+REF_DIR=$(mktemp -d "$HOME/fsl-upright-ref60.XXXXXX")
+mcflirt -in "$STUDY_ROOT/volunteer2/upright/BOLD_original.nii.gz" \
+  -out "$REF_DIR/upright_ref60" -refvol 59 -plots -rmsrel -rmsabs
+```
+
+### Recompute the archived four-scan comparison
+
+The replay script reads the archived `volunteer1/` and `volunteer2/` trees and writes into a new directory. Volunteer 2 requires the `analysis_qc/` products above and the `coverage_qc/` transforms from the coverage stage. The script checks the grids before sampling the native space images.
+
+```bash
+STUDY_ROOT="/path/to/authorised/study"
+FOUR_OUT="$HOME/fsl-four-scan-replay"
+OPENBLAS_NUM_THREADS=1 "$PILOT_PYTHON" four_scan_analysis.py \
+  --root "$STUDY_ROOT" --fsldir "$FSLDIR" --out "$FOUR_OUT"
+cat "$FOUR_OUT/analysis_summary.csv"
+wc -l "$FOUR_OUT/common_nodes.csv"
+```
+
+Use `common_nodes.csv`, `analysis_summary.csv` and `split_half_sensitivity.csv` for coverage and agreement checks. `*_retained.csv` records the joint and matched frame selections on the original volume axis. `*_edge_differences.csv` and `edges_consistent_all_settings.csv` preserve the exploratory contrast definitions. The archive replay regenerated the 29 labels, the 77-volume minimum and all six condition tables.
 
 ## 9. Optional B0 distortion correction
 
@@ -292,9 +413,130 @@ ls "$WORK/qc/"*_{first,second}.csv
 
 已获得项目中间文件的读者可用 `bash run.sh replay NEW_WORK V1_ARCHIVE` 在新目录复算。后续两体位覆盖可用 `bash run.sh coverage-replay NEW_WORK V2_ARCHIVE V1_PARCELS_CSV` 对照第一对扫描。脚本中列出期望文件名。原始影像、运行日志和派生影像都放在获授权的研究数据空间。
 
-## 8. 把覆盖筛选扩展到第二对扫描
+## 8. 完成第二对扫描并做四扫描对照
 
 用全程原始平均 BOLD 与 BET 筛信号覆盖，用去头 3 帧后的原始平均图跑 BBR。历史流程中曾重新定义仰卧位 T1 的 BET 中心，并裁剪后跑 FAST。新影像应在自己的 T1 上定位中心和裁剪范围，之后将白质掩膜映回完整结构网格。把每次扫描的**几何覆盖**和**可用信号比例**分别记录，再按相同的 70% 和 50 体素门槛取四次交集。
+
+### 原始两体位扫描已完成的分析
+
+本节使用第二位志愿者的**原始 250 帧仰卧位和直立位**数据。四扫描对照在去掉最初 3 帧后分析，每次 247 帧。第 9 节的场图校正仍待参数核实。
+
+**配准与 ICA。** 对志愿者 2，先用完整 250 帧做 MCFLIRT，再裁掉头 3 帧并取均值。沿用覆盖检查中已复核的 BBR 变换，把运动校正后的平均 BOLD 叠到各自的 T1。BET 和 ICA 使用来自实际分析帧的平均图和 EPI 脑掩膜。随后做 100 s 高通，在原生 BOLD 网格用 MELODIC 自动选维，保持未做空间平滑。
+
+```bash
+# 指向有写权限的分析副本，保留原始存档。
+STUDY_ROOT="/path/to/authorised/study"
+for posture in supine upright; do
+  (
+    cd "$STUDY_ROOT/volunteer2/$posture"
+    mkdir -p analysis_qc
+    mcflirt -in BOLD_original -out analysis_qc/BOLD_mc -plots -rmsrel -rmsabs
+    fslroi analysis_qc/BOLD_mc analysis_qc/BOLD_trim3 3 247
+    fslmaths analysis_qc/BOLD_trim3 -Tmean analysis_qc/BOLD_mean_mc
+    bet analysis_qc/BOLD_mean_mc analysis_qc/BOLD_brain -f 0.30 -m
+    fslmaths analysis_qc/BOLD_trim3 -bptf 13.157895 -1 \
+      -add analysis_qc/BOLD_mean_mc analysis_qc/BOLD_hp100 -odt float
+    melodic -i analysis_qc/BOLD_hp100.nii.gz -o analysis_qc/single.ica \
+      --tr=3.8 --nobet -m analysis_qc/BOLD_brain_mask.nii.gz --Omean
+  )
+done
+```
+
+**为什么白质有两个版本？** 仰卧位先把裁剪后 FAST 的连续白质概率图映回完整 T1，再映到原生 EPI。直立位使用映到原生 BOLD 的二值白质分割。历史图谱用已有 MNI → BOLD 仿射和最近邻插值。归档的配准参考和分析影像共用原生网格，四扫描复算直接读取这些图和掩膜。
+
+```bash
+ATLAS="$FSLDIR/data/atlases/HarvardOxford/HarvardOxford-cort-maxprob-thr25-2mm.nii.gz"
+(
+  cd "$STUDY_ROOT/volunteer2/supine"
+  flirt -in "$ATLAS" -ref coverage_qc/BOLD_mean -applyxfm \
+    -init coverage_qc/MNI_to_BOLD_centered.mat -interp nearestneighbour -out analysis_qc/atlas_native
+  convert_xfm -omat analysis_qc/T1_to_BOLD.mat -inverse coverage_qc/BOLD_to_T1_centered.mat
+  flirt -in coverage_qc/T1_centered_crop_fast_pve_2 -ref coverage_qc/T1_1mm \
+    -applyxfm -usesqform -interp trilinear -out analysis_qc/T1_wm_pve
+  flirt -in analysis_qc/T1_wm_pve -ref coverage_qc/BOLD_mean -applyxfm \
+    -init analysis_qc/T1_to_BOLD.mat -interp trilinear -out analysis_qc/WM_pve_native
+)
+(
+  cd "$STUDY_ROOT/volunteer2/upright"
+  flirt -in "$ATLAS" -ref coverage_qc/BOLD_mean -applyxfm \
+    -init coverage_qc/MNI_to_BOLD.mat -interp nearestneighbour -out analysis_qc/atlas_native
+  convert_xfm -omat analysis_qc/T1_to_BOLD.mat -inverse coverage_qc/BOLD_to_T1.mat
+  flirt -in coverage_qc/BOLD_to_T1_fast_wmseg -ref coverage_qc/BOLD_mean \
+    -applyxfm -init analysis_qc/T1_to_BOLD.mat -interp nearestneighbour -out analysis_qc/WM_binary_native
+)
+```
+
+| 志愿者 2 扫描 | MELODIC 成分数 | 回归成分及其原生切片（从 1 开始） | 目标切片 SD 降幅 |
+| --- | ---: | --- | ---: |
+| 仰卧位 | 52 | IC 6 → 17 层，IC 9 → 9 层，IC 5 → 15 层 | 40–47% |
+| 直立位 | 74 | IC 16 → 8 层，IC 18 → 9 层，IC 31 → 6 层 | 34–35% |
+
+选择成分时同时看单层空间集中和成分时间曲线与原始层信号是否一致。重跑应以当轮空间图和时间曲线复核编号。两次回归都保留 247 帧。比较逐层体素中位百分比信号的时间 SD，检查降幅是否集中在目标切片。
+
+```bash
+read -r -p 'Reviewed supine IC IDs: ' V2_SUPINE_ICS
+read -r -p 'Reviewed upright IC IDs: ' V2_UPRIGHT_ICS
+for posture in supine upright; do
+  (
+    cd "$STUDY_ROOT/volunteer2/$posture/analysis_qc"
+    if [ "$posture" = supine ]; then ids="$V2_SUPINE_ICS"; else ids="$V2_UPRIGHT_ICS"; fi
+    fsl_regfilt -i BOLD_hp100 -d single.ica/melodic_mix -m single.ica/mask \
+      -f "$ids" -o BOLD_ica_clean
+    fslval BOLD_ica_clean dim4
+  )
+done
+```
+
+### 固定共同脑区，再比较六种设置
+
+用四次扫描运动校正后的平均图和 ICA 掩膜重新筛选。志愿者 1 仰卧、直立和志愿者 2 仰卧、直立分别通过 **41、30、35、34** 个脑区。四次交集仍为 **29** 个 Harvard–Oxford 皮层标签（最大概率图谱，阈值 25，2 mm，双侧合并）。上一轮用原始平均图初筛，志愿者 2 的直立位有 35 个脑区通过。两轮的均值和掩膜来源不同。
+
+Power FD 用 50 mm 旋转半径。DVARS 是相邻帧逐体素差的均方根，除以腐蚀后可用脑区所有时点的中位信号，按百分比表示。按每个扫描自身 246 次转换的 `Q3 + 1.5 × IQR` 标记异常。裁剪后首帧的 FD 和 DVARS 以 0 占位并参加保留筛选，下面计算平均 FD 时省略占位值。这里使用裁剪后转换，志愿者 1 的数字与第 2 节全序列结果可能略有差异。
+
+| 扫描 | 平均 Power FD（mm） | FD ≤ 0.30 mm 保留 | FD 和 DVARS 同时通过 |
+| --- | ---: | ---: | ---: |
+| 志愿者 1 仰卧 | 0.076 | 247 | 231 / 247 |
+| 志愿者 1 直立 | 0.289 | 164 | 162 / 247 |
+| 志愿者 2 仰卧 | 0.194 | 222 | 216 / 247 |
+| 志愿者 2 直立 | 0.995 | 77 | 77 / 247 |
+
+在节点时间序列上拟合截距、6 个头动参数、6 个一阶差分和 1 个深部白质均值。每种条件只用保留的帧重新拟合。此处白质均值对所有合格体素等权，要求白质值 ≥ 0.95，距 0.80 掩膜边缘至少 3 mm，并排除所有有原生皮层图谱标签的体素。志愿者 2 直立位使用二值白质掩膜。第 6 节的先导比较只回归白质并按切片等权，四扫描阶段采用这里记录的定义。
+
+| 设置 | 输入与帧选择 |
+| --- | --- |
+| `hp_all` | 高通 BOLD，247 帧全保留 |
+| `ica_all` | ICA 去噪 BOLD，247 帧全保留 |
+| `motion_wm_all` | ICA 去噪后回归头动和白质，247 帧全保留 |
+| `motion_wm_fd03` | 用 FD ≤ 0.30 mm 的帧拟合并计算 |
+| `motion_wm_fd03_dvars` | 在同时通过 FD 与 DVARS 的帧上拟合并计算 |
+| `motion_wm_matched` | 四次扫描各在通过联合筛选的 77 帧上拟合并计算 |
+
+匹配时按**保留帧列表中的位置**均匀抽选，保留原始顺序和编号。这 77 帧可以不连续，每个混杂设计秩为 14。四次都计算同顺序的 29 × 29 矩阵，再对每位做「直立减仰卧」。匹配分析有 **185 / 406** 条边在两人身上同向，六种设置中两人均同向的有 **32 / 406** 条，属于事后描述性筛选。体位比较目前只覆盖两位及四次扫描，尤其受第二位直立扫描头动限制。
+
+### 排查第二位直立位的异常头动峰值
+
+把原始第 60 帧指定为 MCFLIRT 参考（`-refvol 59` 按 0 开始计数），再按相同裁剪计算 FD。参考帧对照的平均 FD 由 **0.995 降到 0.972 mm**，**仅按 FD** 通过的帧数由 **77 增至 82**，主要峰值仍然存在。以原始第 250 帧与其前一帧为例，脑掩膜内的空间相关从原始 **约 0.52** 提高到默认头动校正后 **约 0.94**。六种设置仍采用默认参考的处理结果，替代参考用于独立质检。
+
+```bash
+REF_DIR=$(mktemp -d "$HOME/fsl-upright-ref60.XXXXXX")
+mcflirt -in "$STUDY_ROOT/volunteer2/upright/BOLD_original.nii.gz" \
+  -out "$REF_DIR/upright_ref60" -refvol 59 -plots -rmsrel -rmsabs
+```
+
+### 用存档复算四扫描结果
+
+复算脚本读取存档 `volunteer1/` 和 `volunteer2/`，写到新输出目录。志愿者 2 需要上面的 `analysis_qc/` 产物及覆盖检查阶段的 `coverage_qc/` 变换。提取前会核对图像网格。
+
+```bash
+STUDY_ROOT="/path/to/authorised/study"
+FOUR_OUT="$HOME/fsl-four-scan-replay"
+OPENBLAS_NUM_THREADS=1 "$PILOT_PYTHON" four_scan_analysis.py \
+  --root "$STUDY_ROOT" --fsldir "$FSLDIR" --out "$FOUR_OUT"
+cat "$FOUR_OUT/analysis_summary.csv"
+wc -l "$FOUR_OUT/common_nodes.csv"
+```
+
+用 `common_nodes.csv`、`analysis_summary.csv`、`split_half_sensitivity.csv` 对照节点、帧数和分半指标。各扫描的 `*_retained.csv` 保留原始帧索引，用于检查联合筛选和匹配选择。`*_edge_differences.csv` 和 `edges_consistent_all_settings.csv` 记录探索性差值。已用存档重算出 29 个标签、77 帧最小保留数以及六种设置的结果表。
 
 ## 9. 可选的 B0 磁敏感畸变校正
 
